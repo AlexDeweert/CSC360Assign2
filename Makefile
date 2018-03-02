@@ -2,7 +2,7 @@
 all: clean Main
 
 Main: Main.c
-	gcc Main.c -lpthread -lrt -o Main
+	gcc Main.c -lpthread -lrt -lm -o Main
 
 .PHONY clean:
 clean:

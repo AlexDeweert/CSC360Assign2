@@ -3,9 +3,13 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/queue.h>
+#include <math.h>
+#define BILLION 1000000000L
+#define MILLION 1000000L
+#define HUND_THOUSAND 100000L
 #define NUM_THREADS 5
 #define COUNT_LIM 13
-#define DEBUG 1
+#define DEBUG 0
 #define LIVE 1
 #define DEAD 0
 #define EMPTY 0
@@ -16,6 +20,7 @@
 //Structs
 typedef struct Trains{
 	char direction;
+	char dir[4];
 	long loading_time;
 	long crossing_time;
 	long train_id;
@@ -30,17 +35,17 @@ typedef struct Node {
 	int train_index;
 } Node;
 
+struct timespec start={0,0}, stop={0,0}, current={0,0};
+
 //Queue heads
 Node* eb_q = NULL;
 Node* Eb_q = NULL;
 Node* wb_q = NULL;
 Node* Wb_q = NULL;
 
-//Prototype
-// int dequeue( Node* head, Node* tail );
-// void printQueue(Node*);
-// void printQueueReverse(Node*);
-// void enqueue(Node*,Node*,long*);
+//Prototypes
+void printTimeStamp();
+void* timer(void*);
 void* dispatcher(void*);
 void* train_function(void*);
 void initializeThreads(Train**,pthread_t**);
@@ -55,11 +60,13 @@ pthread_mutex_t mutex_dispatch = PTHREAD_MUTEX_INITIALIZER; //Train will lock th
 pthread_mutex_t mutex_cross = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_train_data = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_queue = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_done = PTHREAD_MUTEX_INITIALIZER;
 
 //Convars
 pthread_cond_t convar_begin_loading = PTHREAD_COND_INITIALIZER;
 pthread_cond_t convar_dispatch = PTHREAD_COND_INITIALIZER;
 pthread_cond_t convar_input_finished = PTHREAD_COND_INITIALIZER;
+pthread_cond_t convar_done = PTHREAD_COND_INITIALIZER;
 
 //Attributes
 pthread_attr_t thread_attr; //also joinable
@@ -76,7 +83,7 @@ int train_count = 0;
 int num_dispatched_trains = 0;
 int sleptCount = 0;
 int queue_count = 0;
-int ebLP_queue_count = 0;
+int accum;
 
 
 int main( int argc, char** argv ) {
@@ -92,6 +99,7 @@ int main( int argc, char** argv ) {
 	Train* train_data;
 	pthread_t* train_threads;
 	pthread_t dispatcher_thread;
+	pthread_t timer_thread;
 	long t;
 	int rc;
 	void* status;
@@ -103,11 +111,14 @@ int main( int argc, char** argv ) {
 	//Read input file and allocate train structs to array
 	readInput(argv[1],&train_data,&arr_size);
 
+	//Clock thread
+	pthread_create( &timer_thread, &thread_attr, timer, (void*)&accum );
+
 	//Create all train threads
 	initializeThreads(&train_data,&train_threads);	
 
 	//Create dispatcher to poll loaded trains
-	pthread_create( &dispatcher_thread, &thread_attr_joinable, dispatcher, (void*)&train_data );
+	pthread_create( &dispatcher_thread, &thread_attr, dispatcher, (void*)&train_data );
 	
 	//INVALUABLE: https://computing.llnl.gov/tutorials/pthreads/samples/dotprod_mutex.c
 	//Can get concurrency without having to call DETACH
@@ -118,6 +129,9 @@ int main( int argc, char** argv ) {
 	for( i = 0; i < train_count; i++ ) {
 		pthread_join( train_threads[i], NULL );
 	}
+	pthread_join( timer_thread, NULL );
+
+	
 	//AFTER JOINING (killing) CLEAN UP
 	pthread_mutex_destroy(&mutex_load);
 	pthread_mutex_destroy(&mutex_dispatch);
@@ -135,16 +149,36 @@ int main( int argc, char** argv ) {
 	pthread_exit(NULL);
 }
 
+void* timer( void* arg ) {
+	//Wait for loading to begin, the convar is broadcasted
+	pthread_mutex_lock(&mutex_load);
+	while( num_live_threads < train_count ) {
+		pthread_cond_wait( &convar_begin_loading, &mutex_load );
+		
+	}
+	if( DEBUG ) printf("CLOCK START!\n");
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	pthread_mutex_unlock(&mutex_load);
+    pthread_exit((void*) 0);
+}
+
+/*Can be used to very accurate timestamps if required*/
+void printTimeStamp() {
+	clock_gettime( CLOCK_MONOTONIC, &current);
+	float hours = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec )) / (float)3600.00), (float)24.00);
+	float minutes = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec )) / (float)60.00), (float)60.00);
+	float seconds = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec ))), (float)60.00);
+	printf("%02.0f:%02.0f:%04.1f",hours,minutes,seconds);
+}
+
 /*Read in the train file*/
 void readInput(char* filename, Train** train_data, int* arr_size) {
-
-	// pthread_mutex_lock(&mutex_train_data);
 	char priority;
 	int loading_time;
 	int crossing_time;
 	int i;
 	(*train_data) = malloc(sizeof(Train)*(*arr_size)); //array of trains
-	if(DEBUG) printf("[DEBUG] Called readInput(), filename input was: \"%s\"\n", filename);
+	if( DEBUG ) printf("[DEBUG] Called readInput(), filename input was: \"%s\"\n", filename);
 	FILE* in = fopen(filename, "r");
 	while( fscanf( in, "%c %d %d *[\n]", &priority, &loading_time, &crossing_time ) != EOF ) {
 		(*train_data)[train_count].direction = priority;
@@ -155,25 +189,23 @@ void readInput(char* filename, Train** train_data, int* arr_size) {
 		(*train_data)[train_count].ready = FALSE;
 		(*train_data)[train_count].dispatched = FALSE;
 		pthread_cond_init(&((*train_data)[train_count].convar_cross), NULL);
+		switch(priority){
+			case 'E': snprintf ( (*train_data)[train_count].dir, 5, "East"); break;
+			case 'e': snprintf ( (*train_data)[train_count].dir, 5, "East"); break;
+			case 'W': snprintf ( (*train_data)[train_count].dir, 5, "West"); break;
+			case 'w': snprintf ( (*train_data)[train_count].dir, 5, "West"); break;
+		}
 		train_count++;
 	}
-	// pthread_cond_broadcast(&convar_input_finished);
-	// pthread_mutex_unlock(&mutex_train_data);
 }
 
 void initializeThreads( Train** train_data, pthread_t** train_threads ) {
-
-	// pthread_mutex_lock(&mutex_train_data);
-	// while( num_live_threads < train_count ) {
-	// 	pthread_cond_wait(&convar_input_finished,&mutex_train_data);
-	// }
-	// pthread_mutex_unlock(&mutex_train_data);
 
 	(*train_threads) = malloc( sizeof(pthread_t)*train_count );
 	int i;
 	for( i = 0; i < train_count; i++ ) {
 		pthread_mutex_lock(&mutex_load);
-		printf("Train %ld waiting to load, %d livethreads exist\n", (*train_data)[i].train_id, num_live_threads);
+		if( DEBUG ) printf("Train %ld waiting to load, %d livethreads exist\n", (*train_data)[i].train_id, num_live_threads);
 		num_live_threads++;
 		pthread_create( &(*train_threads)[i], &thread_attr, train_function, (void*)&(*train_data)[i] );
 		
@@ -193,10 +225,10 @@ void* train_function( void* arg ) {
 			pthread_cond_wait( &convar_begin_loading, &mutex_load );
 			
 		}
-		printf("Train %ld loading...\n", train_data->train_id);
+		if( DEBUG ) printf("Train %ld loading...\n", train_data->train_id);
 	pthread_mutex_unlock(&mutex_load);
 	usleep( train_data->loading_time * 100000 );
-	printf("Train %ld finished loading!\n", train_data->train_id);
+	if( DEBUG ) printf("Train %ld finished loading!\n", train_data->train_id);
 
 	//Lock the queue mutex and add a new train entry to the appropriate queue
 	pthread_mutex_lock(&mutex_queue);
@@ -206,7 +238,9 @@ void* train_function( void* arg ) {
 	temp->train_index = train_data->train_id;
 	temp->next = NULL;
 
-	printf("Adding train to queue: %d\n", temp->train_index);
+	if( DEBUG ) printf("Adding train to queue: %d\n", temp->train_index);
+	printTimeStamp();
+	printf(" Train %ld is ready to go %s\n", train_data->train_id, train_data->dir);
 	//Any loaded train goes into the loaded queue
 	//Clearly, loaded trains get sent to their respective queues first
 	if( train_data->direction == 'E') {
@@ -258,6 +292,8 @@ void* train_function( void* arg ) {
 			wb_q = temp;
 		}
 	}
+	//to prevent spurious wakeup of dispatch convar
+	queue_count++;
 	//There are trains in the queues, signal dispatcher
 	pthread_cond_signal(&convar_dispatch);
 	pthread_mutex_unlock(&mutex_queue);
@@ -268,9 +304,11 @@ void* train_function( void* arg ) {
 		pthread_cond_wait( &(train_data->convar_cross), &mutex_cross );
 	}
 	//Critical section here
-	printf("Train %ld CROSSING!\n", train_data->train_id);
+	printTimeStamp();
+	printf(" Train %ld is ON the main track going %s\n", train_data->train_id, train_data->dir);
 	usleep( train_data->crossing_time * 100000 );
-	printf("Train %ld Finished Crossing!\n", train_data->train_id);
+	printTimeStamp();
+	printf(" Train %ld is OFF the main track after going %s\n", train_data->train_id, train_data->dir);
 	num_dispatched_trains++;
 	pthread_mutex_unlock(&mutex_cross);
 	free(temp);
@@ -282,37 +320,70 @@ void* dispatcher( void* arg ) {
 
 	//Wait until we get the greenlight from trains
 	pthread_mutex_lock(&mutex_dispatch);
-	pthread_cond_wait(&convar_dispatch,&mutex_dispatch);
+	while( queue_count < 1 ) {
+		pthread_cond_wait(&convar_dispatch,&mutex_dispatch);	
+	}
 	pthread_mutex_unlock(&mutex_dispatch);
 
 	Train** train_data = (Train**)arg;
 
+	/* Sim logic pseudo
+	   -If only one train in queue, cross
+	   -If > 1 train in queue, higher priority first
+	   -If > 1 train in queue, same priority, 
+
+
+	*/
+
 	while(num_dispatched_trains < train_count) {
-		//usleep(800000);
 		int next_train;
 
-		if( Eb_q != NULL ) {
+		pthread_mutex_lock(&mutex_queue);
+		//If EB high pri train, and other high-pri queue is empty, always send high pri over low pri
+		if( Eb_q != NULL && Wb_q == NULL ) {
 			next_train = Eb_q->train_index;
+			if( DEBUG ) printf("Popped from Eb_q: %d\n", next_train);
 			Eb_q = Eb_q->next;
 		}
-		else if( Wb_q != NULL ) {
+		//Same direction, same pri, Eb has priority (FOR NOW!)
+		else if( Eb_q != NULL && Wb_q != NULL ) {
+			next_train = Eb_q->train_index;
+			if( DEBUG ) printf("Popped from Eb_q: %d\n", next_train);
+			Eb_q = Eb_q->next;
+		}
+		//Conversely (send Wb high-pri over low-pri trains)
+		else if( Wb_q != NULL && Eb_q == NULL ) {
 			next_train = Wb_q->train_index;
+			if( DEBUG ) printf("Popped from Wb_q: %d\n", next_train);
+			Wb_q = Wb_q->next;
+		}
+		//Conversely (send Wb high-pri over low-pri trains)
+		else if( Wb_q != NULL && Eb_q != NULL ) {
+			next_train = Wb_q->train_index;
+			if( DEBUG ) printf("Popped from Wb_q: %d\n", next_train);
 			Wb_q = Wb_q->next;
 		}
 		else if( eb_q != NULL ) {
 			next_train = eb_q->train_index;
+			if( DEBUG ) printf("Popped from eb_q: %d\n", next_train);
 			eb_q = eb_q->next;
 		}
 		else if( wb_q != NULL ) {
 			next_train = wb_q->train_index;
+			if( DEBUG ) printf("Popped from wb_q: %d\n", next_train);
 			wb_q = wb_q->next;
 		}
+		pthread_mutex_unlock(&mutex_queue);
 
 		pthread_mutex_lock(&mutex_cross);
 		(*train_data)[next_train].dispatched = TRUE;
 		pthread_cond_signal( &(*train_data)[next_train].convar_cross );
 		pthread_mutex_unlock(&mutex_cross);	
 	}
+	//Timer can stop
+	pthread_mutex_lock(&mutex_done);
+	pthread_cond_signal(&convar_done);
+	pthread_mutex_unlock(&mutex_done);
 	
 	pthread_exit((void*) 0);
 }
