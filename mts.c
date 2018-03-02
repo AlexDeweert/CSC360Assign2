@@ -9,7 +9,7 @@
 #define HUND_THOUSAND 100000L
 #define NUM_THREADS 5
 #define COUNT_LIM 13
-#define DEBUG 0
+#define DEBUG 1
 #define LIVE 1
 #define DEAD 0
 #define EMPTY 0
@@ -51,7 +51,7 @@ void initializeThreads(Train**,pthread_t**);
 void printArray(Train**);
 void readInput(char*,Train**,int*);
 void* load_controller(void*);
-int resolveQueue(char,Train**);
+void* resolveQueue(char,Train**);
 
 //Mutexes
 pthread_mutex_t mutex_load = PTHREAD_MUTEX_INITIALIZER;
@@ -291,61 +291,120 @@ void* train_function( void* arg ) {
 	printf(" Train %ld is OFF the main track after going %s\n", train_data->train_id, train_data->dir);
 	num_dispatched_trains++;
 	pthread_mutex_unlock(&mutex_cross);
-	free(temp);
 	pthread_exit((void*) 0);
 }
 
 //Poll loaded trains for dispatch
 void* dispatcher( void* arg ) {
 
-	//Wait until we get the greenlight from trains
+	Train** train_data = (Train**)arg;
 	pthread_mutex_lock(&mutex_dispatch);
 	while( queue_count < 1 ) {
 		pthread_cond_wait(&convar_dispatch,&mutex_dispatch);	
 	}
 	pthread_mutex_unlock(&mutex_dispatch);
 
-	Train** train_data = (Train**)arg;
-
 	while(num_dispatched_trains < train_count) {
-		int next_train;
+		//This would probably be better solved with a convar
+		//but for now it works fine and doesn't seem to change the
+		//timestamps too much even with extreme test input 
+		//(ie all arrive at 1, load for 1, in the same direction)
+		usleep(20000);
 
 		pthread_mutex_lock(&mutex_queue);
+		int next_train;
 		//If EB high pri train, and other high-pri queue is empty, always send high pri over low pri
-		
 		//Two equal, high priority trains face eachother
-		if( Eb_q != NULL && Wb_q != NULL ) {
-			//Send E if west went last, or if none have gone
-			if( last_to_cross == 'W' || last_to_cross == '\0' ) {
-				next_train = resolveQueue('E',train_data);
-				if( DEBUG ) printf("Popped from Eb_q: %d\n", next_train);
-				Eb_q = Eb_q->next;
-				last_to_cross = 'E';	
+		if( Eb_q != NULL || Wb_q != NULL ) {
+			if( Eb_q != NULL && Wb_q != NULL ) {
+				//Send E if west went last, or if none have gone
+				if( last_to_cross == 'W' || last_to_cross == '\0' ) {
+					resolveQueue('E',&(*train_data));
+					next_train = Eb_q->train_index;
+					Node* temp = Eb_q;
+					Eb_q = Eb_q->next;
+					free(temp);
+					last_to_cross = 'E';	
+				}
+				//Send W if east went last
+				else if( last_to_cross == 'E' ) {
+					resolveQueue('W',&(*train_data));
+					next_train = Wb_q->train_index;
+					Node* temp = Wb_q;
+					Wb_q = Wb_q->next;
+					free(temp);
+					last_to_cross = 'W';
+				}
 			}
-			//Send W if east went last
-			else if( last_to_cross == 'E' ) {
+			//Eb ready, Wb null
+			else if( Eb_q != NULL && Wb_q == NULL ) {
+				resolveQueue('E',&(*train_data));
+				next_train = Eb_q->train_index;
+				Node* temp = Eb_q;
+				Eb_q = Eb_q->next;
+				free(temp);
+				last_to_cross = 'E';
+			}
+			//Wb ready, Eb null
+			else if( Wb_q != NULL && Eb_q == NULL ) {
+				resolveQueue('W',&(*train_data));
 				next_train = Wb_q->train_index;
-				if( DEBUG ) printf("Popped from Wb_q: %d\n", next_train);
+				Node* temp = Wb_q;
 				Wb_q = Wb_q->next;
+				free(temp);
 				last_to_cross = 'W';
 			}
+			else {
+				printf("Not catching something\n");
+			}
 		}
+		
+		else {
+			//The low priority stuff
+			if( eb_q != NULL && wb_q != NULL ) {
+				//Send E if west went last, or if none have gone
+				if( last_to_cross == 'w' || last_to_cross == '\0' ) {
+					resolveQueue('e',&(*train_data));
+					next_train = eb_q->train_index;
+					Node* temp = eb_q;
+					eb_q = eb_q->next;
+					free(temp);
+					last_to_cross = 'e';
+				}
+				//Send w if east went last
+				else if( last_to_cross == 'e' ) {
+					resolveQueue('w',&(*train_data));
+					next_train = wb_q->train_index;
+					Node* temp = wb_q;
+					wb_q = wb_q->next;
+					free(temp);
+					last_to_cross = 'w';
+				}
+			}
+			//eb ready, wb null
+			else if( eb_q != NULL && wb_q == NULL ) {
+				resolveQueue('e',&(*train_data));
+				next_train = eb_q->train_index;
+				Node* temp = eb_q;
+				eb_q = eb_q->next;
+				free(temp);
+				last_to_cross = 'e';
+			}
+			//Wb ready, Eb null
+			else if( wb_q != NULL && eb_q == NULL ) {
+				resolveQueue('w',&(*train_data));
+				next_train = wb_q->train_index;
+				Node* temp = wb_q;
+				wb_q = wb_q->next;
+				free(temp);
+				last_to_cross = 'w';
+			}
+			else {
+				printf("Not catching something\n");	
+			}
+		}
+		
 
-		//Eb ready, Wb null
-		else if( Eb_q != NULL && Wb_q == NULL ) {
-			//next_train = Eb_q->train_index;
-			next_train = resolveQueue('E',train_data);
-			if( DEBUG ) printf("Popped from Eb_q: %d\n", next_train);
-			Eb_q = Eb_q->next;
-			last_to_cross = 'E';
-		}
-		//Wb ready, Eb null
-		else if( Wb_q != NULL && Eb_q == NULL ) {
-			next_train = Wb_q->train_index;
-			if( DEBUG ) printf("Popped from Wb_q: %d\n", next_train);
-			Wb_q = Wb_q->next;
-			last_to_cross = 'W';
-		}
 		pthread_mutex_unlock(&mutex_queue);
 
 		pthread_mutex_lock(&mutex_cross);
@@ -361,68 +420,141 @@ walk through the queue from tail to head to ensure that there isn't a
 train that's ready with the same loading time, but a lower id (which indicates
 that the train appeared in the input file first)
 */
-int resolveQueue(char station, Train** train_data){
-	long head_loading_time;
+void* resolveQueue(char station, Train** train_data){
+	long loading_time;
 	int head_train_index;
+	int smallest_index;
+	int temp;
 	int do_swap = FALSE;
 	Node* cur;
 	switch(station){
-		printf("Doing this\n");
 		case 'E':
 		if( Eb_q->next != NULL ) {
-			head_loading_time = (*train_data)[Eb_q->train_index].loading_time;
-			head_train_index = Eb_q->train_index;
+			loading_time = (*train_data)[Eb_q->train_index].loading_time;
+			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %ld\n", loading_time);
+			smallest_index = Eb_q->train_index;
+			if( DEBUG ) printf("[resolveQueue] Smallest index so far %d\n", smallest_index);
 			cur = Eb_q->next;
 			while( cur != NULL ) {
 				//compare current train heads loading time to each node, going backwards
 				//If the current node loading time equal, but train_id is smaller...
-				if( head_loading_time == (*train_data)[cur->train_index].loading_time && head_train_index > cur->train_index ) {
+				if( loading_time == (*train_data)[cur->train_index].loading_time && smallest_index > cur->train_index ) {
 					//set head_train_index to the current node (in queue trace)
-					head_train_index = cur->train_index;
+					if( DEBUG ) printf("[resolveQueue] Found smallest_index!!\n");
+					smallest_index = cur->train_index;
 					do_swap = TRUE;
 				}
 				cur = cur->next;
 			}
-			//Once the end of the queue is reached, the swap the node with highest_pri id and the train_id (that we started with)
 			if( do_swap ) {
-			    // Initialize previous and current pointers
-			    Node* prev = Eb_q;
-			    cur = Eb_q->next;
-			 
-			    Eb_q = cur;  // Change head before proceeeding
-			 
-			    // Traverse the list
-			    while (1)
-			    {
-			        Node* next = cur->next;
-			        cur->next = prev; // Change next of current as previous node
-			 
-			        // If next NULL or next is the last node
-			        if (next == NULL || next->next == NULL)
-			        {
-			            prev->next = next;
-			            break;
-			        }
-			 
-			        // Change next of previous to next next
-			        prev->next = next->next;
-			        // Update previous and curr
-			        prev = next;
-			        cur = prev->next;
-			    }
+				cur = Eb_q->next;
+				while( cur->train_index != smallest_index ) cur = cur->next;
+				//now swap data between cur and head
+				temp = Eb_q->train_index;
+				cur->train_index = temp;
+				if( DEBUG ) printf("Setting EB HEAD smallest index to: %d\n", smallest_index);
+				Eb_q->train_index = smallest_index;
 			}
-			return head_train_index;
-		} //else simply return head index since its only one in queue
-		return Eb_q->train_index;
+		}
+		else {
+			if( DEBUG ) printf("[resolveQueue] Eb_q-next is NULL!\n");
+		}
 		break;
 		case 'e':
-			return 1;
+		if( eb_q->next != NULL ) {
+			loading_time = (*train_data)[eb_q->train_index].loading_time;
+			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %ld\n", loading_time);
+			smallest_index = eb_q->train_index;
+			if( DEBUG ) printf("[resolveQueue] Smallest index so far %d\n", smallest_index);
+			cur = eb_q->next;
+			while( cur != NULL ) {
+				//compare current train heads loading time to each node, going backwards
+				//If the current node loading time equal, but train_id is smaller...
+				if( loading_time == (*train_data)[cur->train_index].loading_time && smallest_index > cur->train_index ) {
+					//set head_train_index to the current node (in queue trace)
+					if( DEBUG ) printf("[resolveQueue] Found smallest_index!!\n");
+					smallest_index = cur->train_index;
+					do_swap = TRUE;
+				}
+				cur = cur->next;
+			}
+			if( do_swap ) {
+				cur = eb_q->next;
+				while( cur->train_index != smallest_index ) cur = cur->next;
+				//now swap data between cur and head
+				temp = eb_q->train_index;
+				cur->train_index = temp;
+				if( DEBUG ) printf("Setting eb HEAD smallest index to: %d\n", smallest_index);
+				eb_q->train_index = smallest_index;
+			}
+		}
+		else {
+			if( DEBUG ) printf("[resolveQueue] eb_q-next is NULL!\n");
+		}
 		break;
 		case 'W':
-			return 1;
+		if( Wb_q->next != NULL ) {
+			loading_time = (*train_data)[Wb_q->train_index].loading_time;
+			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %ld\n", loading_time);
+			smallest_index = Wb_q->train_index;
+			if( DEBUG ) printf("[resolveQueue] Smallest index so far %d\n", smallest_index);
+			cur = Wb_q->next;
+			while( cur != NULL ) {
+				//compare current train heads loading time to each node, going backwards
+				//If the current node loading time equal, but train_id is smaller...
+				if( loading_time == (*train_data)[cur->train_index].loading_time && smallest_index > cur->train_index ) {
+					//set head_train_index to the current node (in queue trace)
+					if( DEBUG ) printf("[resolveQueue] Found smallest_index!!\n");
+					smallest_index = cur->train_index;
+					do_swap = TRUE;
+				}
+				cur = cur->next;
+			}
+			if( do_swap ) {
+				cur = Wb_q->next;
+				while( cur->train_index != smallest_index ) cur = cur->next;
+				//now swap data between cur and head
+				temp = Wb_q->train_index;
+				cur->train_index = temp;
+				if( DEBUG ) printf("Setting EB HEAD smallest index to: %d\n", smallest_index);
+				Wb_q->train_index = smallest_index;
+			}
+		}
+		else {
+			if( DEBUG ) printf("[resolveQueue] Wb_q-next is NULL!\n");
+		}
 		break;
 		case 'w':
-			return 1;
+		if( wb_q->next != NULL ) {
+			loading_time = (*train_data)[wb_q->train_index].loading_time;
+			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %ld\n", loading_time);
+			smallest_index = wb_q->train_index;
+			if( DEBUG ) printf("[resolveQueue] Smallest index so far %d\n", smallest_index);
+			cur = wb_q->next;
+			while( cur != NULL ) {
+				//compare current train heads loading time to each node, going backwards
+				//If the current node loading time equal, but train_id is smaller...
+				if( loading_time == (*train_data)[cur->train_index].loading_time && smallest_index > cur->train_index ) {
+					//set head_train_index to the current node (in queue trace)
+					if( DEBUG ) printf("[resolveQueue] Found smallest_index!!\n");
+					smallest_index = cur->train_index;
+					do_swap = TRUE;
+				}
+				cur = cur->next;
+			}
+			if( do_swap ) {
+				cur = wb_q->next;
+				while( cur->train_index != smallest_index ) cur = cur->next;
+				//now swap data between cur and head
+				temp = wb_q->train_index;
+				cur->train_index = temp;
+				if( DEBUG ) printf("Setting wb HEAD smallest index to: %d\n", smallest_index);
+				wb_q->train_index = smallest_index;
+			}
+		}
+		else {
+			if( DEBUG ) printf("[resolveQueue] wb_q-next is NULL!\n");
+		}
 		break;
 	}
 }

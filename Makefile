@@ -1,8 +1,8 @@
 .phony all:
-all: clean Main
+all: clean mts
 
-Main: Main.c
-	gcc Main.c -lpthread -lrt -lm -o Main
+mts: mts.c
+	gcc mts.c -lpthread -lrt -lm -o mts
 
 .PHONY clean:
 clean:
