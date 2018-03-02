@@ -45,14 +45,13 @@ Node* Wb_q = NULL;
 
 //Prototypes
 void printTimeStamp();
-void* timer(void*);
 void* dispatcher(void*);
 void* train_function(void*);
 void initializeThreads(Train**,pthread_t**);
 void printArray(Train**);
 void readInput(char*,Train**,int*);
 void* load_controller(void*);
-//int peek(Node*);
+int resolveQueue(char,Train**);
 
 //Mutexes
 pthread_mutex_t mutex_load = PTHREAD_MUTEX_INITIALIZER;
@@ -60,21 +59,15 @@ pthread_mutex_t mutex_dispatch = PTHREAD_MUTEX_INITIALIZER; //Train will lock th
 pthread_mutex_t mutex_cross = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_train_data = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_queue = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutex_done = PTHREAD_MUTEX_INITIALIZER;
 
 //Convars
 pthread_cond_t convar_begin_loading = PTHREAD_COND_INITIALIZER;
 pthread_cond_t convar_dispatch = PTHREAD_COND_INITIALIZER;
 pthread_cond_t convar_input_finished = PTHREAD_COND_INITIALIZER;
-pthread_cond_t convar_done = PTHREAD_COND_INITIALIZER;
 
 //Attributes
 pthread_attr_t thread_attr; //also joinable
 pthread_attr_t thread_attr_joinable;
-
-//Semaphores
-sem_t semaphore_all_threads_dead;
-sem_t semaphore_trains_live;
 
 //Globals and definitions
 int num_live_threads = 0;
@@ -83,7 +76,11 @@ int train_count = 0;
 int num_dispatched_trains = 0;
 int sleptCount = 0;
 int queue_count = 0;
+char last_to_cross = '\0';
 int accum;
+int hours;
+int minutes;
+double seconds;
 
 
 int main( int argc, char** argv ) {
@@ -99,7 +96,6 @@ int main( int argc, char** argv ) {
 	Train* train_data;
 	pthread_t* train_threads;
 	pthread_t dispatcher_thread;
-	pthread_t timer_thread;
 	long t;
 	int rc;
 	void* status;
@@ -111,28 +107,23 @@ int main( int argc, char** argv ) {
 	//Read input file and allocate train structs to array
 	readInput(argv[1],&train_data,&arr_size);
 
-	//Clock thread
-	pthread_create( &timer_thread, &thread_attr, timer, (void*)&accum );
-
 	//Create all train threads
 	initializeThreads(&train_data,&train_threads);	
 
 	//Create dispatcher to poll loaded trains
 	pthread_create( &dispatcher_thread, &thread_attr, dispatcher, (void*)&train_data );
 	
-	//INVALUABLE: https://computing.llnl.gov/tutorials/pthreads/samples/dotprod_mutex.c
+	//Useful: https://computing.llnl.gov/tutorials/pthreads/samples/dotprod_mutex.c
 	//Can get concurrency without having to call DETACH
-	//by doing the join down here...wtf
+	//by doing the join down here...
 	pthread_attr_destroy(&thread_attr);
 	pthread_attr_destroy(&thread_attr_joinable);
 	pthread_join( dispatcher_thread, NULL );
 	for( i = 0; i < train_count; i++ ) {
 		pthread_join( train_threads[i], NULL );
 	}
-	pthread_join( timer_thread, NULL );
 
-	
-	//AFTER JOINING (killing) CLEAN UP
+	//CLEAN UP
 	pthread_mutex_destroy(&mutex_load);
 	pthread_mutex_destroy(&mutex_dispatch);
 	pthread_mutex_destroy(&mutex_cross);
@@ -149,26 +140,14 @@ int main( int argc, char** argv ) {
 	pthread_exit(NULL);
 }
 
-void* timer( void* arg ) {
-	//Wait for loading to begin, the convar is broadcasted
-	pthread_mutex_lock(&mutex_load);
-	while( num_live_threads < train_count ) {
-		pthread_cond_wait( &convar_begin_loading, &mutex_load );
-		
-	}
-	if( DEBUG ) printf("CLOCK START!\n");
-	clock_gettime(CLOCK_MONOTONIC, &start);
-	pthread_mutex_unlock(&mutex_load);
-    pthread_exit((void*) 0);
-}
-
 /*Can be used to very accurate timestamps if required*/
 void printTimeStamp() {
 	clock_gettime( CLOCK_MONOTONIC, &current);
-	float hours = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec )) / (float)3600.00), (float)24.00);
-	float minutes = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec )) / (float)60.00), (float)60.00);
-	float seconds = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec ))), (float)60.00);
-	printf("%02.0f:%02.0f:%04.1f",hours,minutes,seconds);
+	hours = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec )) / (double)3600.00), (double)24.00);
+	minutes = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec )) / (double)60.00), (double)60.00);
+	seconds = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec ))), (double)60.00);
+	//printf("\n%02d:%02d:%04.1f\n",hours,minutes,seconds);
+	printf("%02d:%02d:%04.1f",hours,minutes,seconds);
 }
 
 /*Read in the train file*/
@@ -211,6 +190,7 @@ void initializeThreads( Train** train_data, pthread_t** train_threads ) {
 		
 		if( num_live_threads == train_count ) {
 			pthread_cond_broadcast(&convar_begin_loading);
+			clock_gettime(CLOCK_MONOTONIC, &start);
 			pthread_cond_signal(&convar_dispatch);
 		}
 		pthread_mutex_unlock(&mutex_load);
@@ -327,51 +307,44 @@ void* dispatcher( void* arg ) {
 
 	Train** train_data = (Train**)arg;
 
-	/* Sim logic pseudo
-	   -If only one train in queue, cross
-	   -If > 1 train in queue, higher priority first
-	   -If > 1 train in queue, same priority, 
-
-
-	*/
-
 	while(num_dispatched_trains < train_count) {
 		int next_train;
 
 		pthread_mutex_lock(&mutex_queue);
 		//If EB high pri train, and other high-pri queue is empty, always send high pri over low pri
-		if( Eb_q != NULL && Wb_q == NULL ) {
-			next_train = Eb_q->train_index;
+		
+		//Two equal, high priority trains face eachother
+		if( Eb_q != NULL && Wb_q != NULL ) {
+			//Send E if west went last, or if none have gone
+			if( last_to_cross == 'W' || last_to_cross == '\0' ) {
+				next_train = resolveQueue('E',train_data);
+				if( DEBUG ) printf("Popped from Eb_q: %d\n", next_train);
+				Eb_q = Eb_q->next;
+				last_to_cross = 'E';	
+			}
+			//Send W if east went last
+			else if( last_to_cross == 'E' ) {
+				next_train = Wb_q->train_index;
+				if( DEBUG ) printf("Popped from Wb_q: %d\n", next_train);
+				Wb_q = Wb_q->next;
+				last_to_cross = 'W';
+			}
+		}
+
+		//Eb ready, Wb null
+		else if( Eb_q != NULL && Wb_q == NULL ) {
+			//next_train = Eb_q->train_index;
+			next_train = resolveQueue('E',train_data);
 			if( DEBUG ) printf("Popped from Eb_q: %d\n", next_train);
 			Eb_q = Eb_q->next;
+			last_to_cross = 'E';
 		}
-		//Same direction, same pri, Eb has priority (FOR NOW!)
-		else if( Eb_q != NULL && Wb_q != NULL ) {
-			next_train = Eb_q->train_index;
-			if( DEBUG ) printf("Popped from Eb_q: %d\n", next_train);
-			Eb_q = Eb_q->next;
-		}
-		//Conversely (send Wb high-pri over low-pri trains)
+		//Wb ready, Eb null
 		else if( Wb_q != NULL && Eb_q == NULL ) {
 			next_train = Wb_q->train_index;
 			if( DEBUG ) printf("Popped from Wb_q: %d\n", next_train);
 			Wb_q = Wb_q->next;
-		}
-		//Conversely (send Wb high-pri over low-pri trains)
-		else if( Wb_q != NULL && Eb_q != NULL ) {
-			next_train = Wb_q->train_index;
-			if( DEBUG ) printf("Popped from Wb_q: %d\n", next_train);
-			Wb_q = Wb_q->next;
-		}
-		else if( eb_q != NULL ) {
-			next_train = eb_q->train_index;
-			if( DEBUG ) printf("Popped from eb_q: %d\n", next_train);
-			eb_q = eb_q->next;
-		}
-		else if( wb_q != NULL ) {
-			next_train = wb_q->train_index;
-			if( DEBUG ) printf("Popped from wb_q: %d\n", next_train);
-			wb_q = wb_q->next;
+			last_to_cross = 'W';
 		}
 		pthread_mutex_unlock(&mutex_queue);
 
@@ -380,12 +353,78 @@ void* dispatcher( void* arg ) {
 		pthread_cond_signal( &(*train_data)[next_train].convar_cross );
 		pthread_mutex_unlock(&mutex_cross);	
 	}
-	//Timer can stop
-	pthread_mutex_lock(&mutex_done);
-	pthread_cond_signal(&convar_done);
-	pthread_mutex_unlock(&mutex_done);
-	
 	pthread_exit((void*) 0);
+}
+
+/*Every time a train is selected to depart from a queue, FIRST
+walk through the queue from tail to head to ensure that there isn't a
+train that's ready with the same loading time, but a lower id (which indicates
+that the train appeared in the input file first)
+*/
+int resolveQueue(char station, Train** train_data){
+	long head_loading_time;
+	int head_train_index;
+	int do_swap = FALSE;
+	Node* cur;
+	switch(station){
+		printf("Doing this\n");
+		case 'E':
+		if( Eb_q->next != NULL ) {
+			head_loading_time = (*train_data)[Eb_q->train_index].loading_time;
+			head_train_index = Eb_q->train_index;
+			cur = Eb_q->next;
+			while( cur != NULL ) {
+				//compare current train heads loading time to each node, going backwards
+				//If the current node loading time equal, but train_id is smaller...
+				if( head_loading_time == (*train_data)[cur->train_index].loading_time && head_train_index > cur->train_index ) {
+					//set head_train_index to the current node (in queue trace)
+					head_train_index = cur->train_index;
+					do_swap = TRUE;
+				}
+				cur = cur->next;
+			}
+			//Once the end of the queue is reached, the swap the node with highest_pri id and the train_id (that we started with)
+			if( do_swap ) {
+			    // Initialize previous and current pointers
+			    Node* prev = Eb_q;
+			    cur = Eb_q->next;
+			 
+			    Eb_q = cur;  // Change head before proceeeding
+			 
+			    // Traverse the list
+			    while (1)
+			    {
+			        Node* next = cur->next;
+			        cur->next = prev; // Change next of current as previous node
+			 
+			        // If next NULL or next is the last node
+			        if (next == NULL || next->next == NULL)
+			        {
+			            prev->next = next;
+			            break;
+			        }
+			 
+			        // Change next of previous to next next
+			        prev->next = next->next;
+			        // Update previous and curr
+			        prev = next;
+			        cur = prev->next;
+			    }
+			}
+			return head_train_index;
+		} //else simply return head index since its only one in queue
+		return Eb_q->train_index;
+		break;
+		case 'e':
+			return 1;
+		break;
+		case 'W':
+			return 1;
+		break;
+		case 'w':
+			return 1;
+		break;
+	}
 }
 
 void printArray( Train** train_data ) {
@@ -399,121 +438,3 @@ void printArray( Train** train_data ) {
 			(*train_data)[i].live );
 	}
 }
-
-
-
-// void printQueue( Node* tail ) {
-// 	if( (*tail) ) {
-// 		if( DEBUG) printf("[printQueue()]QUEUE: Tail to head: ");
-// 		Node cur = NULL;
-// 		//Cur should be the dereferenced tail otherwise it will modify the pointer
-// 		//to the original tail (very annoying to debug)
-// 		cur = (*tail);
-// 		while( cur != NULL ) {
-// 			if( cur->p_next == NULL ) printf("%ld", cur->data);
-// 			else printf("%ld(next)->", cur->data);
-// 			cur = cur->p_next;
-// 		}
-// 		printf("\n");
-// 	}
-// 	else {
-// 		printf("CANNOT PRINT! Nothing in queue\n");	
-// 	}
-
-	
-	
-// }
-
-// void printQueueReverse( Node* head ) {
-
-// 	if( (*head) ) {
-// 		if( DEBUG) printf("[printQueueReverse()]QUEUE: Head to tail: ");
-// 		Node cur = NULL;
-// 		//Cur should be the dereferenced tail otherwise it will modify the pointer
-// 		//to the original tail (very annoying to debug)
-// 		cur = (*head);
-// 		while( cur != NULL ) {
-// 			if( cur->p_prev == NULL ) printf("%ld", cur->data);
-// 			else printf("%ld(prev)->", cur->data);
-// 			cur = cur->p_prev;
-// 		}
-// 		printf("\n");	
-// 	}
-// 	else {
-// 		printf("CANNOT PRINT! Nothing in queue\n");
-// 	}
-	
-// }
-
-// int peek( Node* head ) {
-// 	if( (*head) ) {
-// 		printf("Element: %ld exists at head\n", (*head)->data);
-// 		return 1;
-// 	}
-// 	else {
-// 		return 0;
-// 	}
-// }
-
-// int dequeue( Node* head, Node* tail ) {
-// 	if( (*head) ) {
-// 		if( DEBUG) printf("[deqeue()]Head was: %ld\n", (*head)->data);
-// 		//Set tempHead to head
-// 		int tempHeadData = (*head)->data;
-// 		Node tempHead = (*head);
-// 		//If head and head-prev exists, set new head to head-prev
-// 		if( (*head)->p_prev ) {
-// 			(*head) = (*head)->p_prev;
-// 			(*head)->p_next = NULL;
-// 			if( DEBUG) printf("[deqeue()]Head now: %ld\n", (*head)->data);
-// 		}
-// 		//Else, just the head exists
-// 		else {
-// 			(*head)->p_prev = NULL;
-// 			(*head)->p_next = NULL;
-// 			(*tail)->p_next = NULL;
-// 			(*tail)->p_prev = NULL;
-// 			// (*head) = NULL;
-// 			// (*tail) = NULL;
-// 			if( DEBUG) printf("[deqeue()]Head AND tail null\n");
-// 		}
-// 		//Deallocate head
-// 		ebLP_queue_count--;
-// 		free(tempHead);
-// 		return tempHeadData;
-// 	}
-// 	else {
-// 		if(DEBUG) printf("Queue empty, cannot dequeue!\n");
-// 		return -1;
-// 	}
-// }
-
-/*
-*/
-// void enqueue( Node* head, Node* tail, long* data ) {
-
-// 	Node temp;
-// 	temp = (Node)malloc( sizeof(struct Queue) );
-// 	temp->data = (*data);
-// 	temp->p_prev = NULL;
-// 	temp->p_next = NULL;
-
-// 	if( (*head) == NULL ) {
-// 		if( DEBUG) printf("Head was NULL, adding node %ld\n", (*data));
-// 		(*head) = temp;
-// 	}
-// 	else {
-// 		if( (*tail) == NULL ) {
-// 			if( DEBUG) printf("Tail was NULL, adding node %ld\n", (*data));
-// 			temp->p_next = (*head);
-// 			(*tail) = temp;
-// 			(*head)->p_prev = (*tail);
-// 		}
-// 		else {
-// 			if( DEBUG) printf("Tail was NOT null, adding node %ld\n", (*data));
-// 			(*tail)->p_prev = temp;
-// 			temp->p_next = (*tail);
-// 			(*tail) = temp;
-// 		}
-// 	}
-// }
