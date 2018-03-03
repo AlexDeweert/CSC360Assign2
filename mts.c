@@ -4,29 +4,18 @@
 #include <semaphore.h>
 #include <sys/queue.h>
 #include <math.h>
-#define BILLION 1000000000L
-#define MILLION 1000000L
-#define HUND_THOUSAND 100000L
-#define NUM_THREADS 5
-#define COUNT_LIM 13
-#define DEBUG 1
-#define LIVE 1
-#define DEAD 0
-#define EMPTY 0
+#define DEBUG 0
 #define FULL 1
 #define TRUE 1
 #define FALSE 0
-#define QUEUE_EMPTY -1
 //Structs
 typedef struct Trains{
 	char direction;
 	char dir[4];
-	long loading_time;
-	long crossing_time;
-	long train_id;
-	long live;
-	long ready;
-	long dispatched;
+	int loading_time;
+	int crossing_time;
+	int train_id;
+	int dispatched;
 	pthread_cond_t convar_cross;
 } Train;
 
@@ -48,14 +37,13 @@ void printTimeStamp();
 void* dispatcher(void*);
 void* train_function(void*);
 void initializeThreads(Train**,pthread_t**);
-void printArray(Train**);
 void readInput(char*,Train**,int*);
-void* load_controller(void*);
 void* resolveQueue(char,Train**);
 
 //Mutexes
 pthread_mutex_t mutex_load = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutex_dispatch = PTHREAD_MUTEX_INITIALIZER; //Train will lock this if ready to get sent to PQ
+pthread_mutex_t mutex_dispatch = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_begin_dispatch = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_cross = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_train_data = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_queue = PTHREAD_MUTEX_INITIALIZER;
@@ -63,6 +51,7 @@ pthread_mutex_t mutex_queue = PTHREAD_MUTEX_INITIALIZER;
 //Convars
 pthread_cond_t convar_begin_loading = PTHREAD_COND_INITIALIZER;
 pthread_cond_t convar_dispatch = PTHREAD_COND_INITIALIZER;
+pthread_cond_t convar_begin_dispatch = PTHREAD_COND_INITIALIZER;
 pthread_cond_t convar_input_finished = PTHREAD_COND_INITIALIZER;
 
 //Attributes
@@ -81,8 +70,9 @@ int accum;
 int hours;
 int minutes;
 double seconds;
+int CROSSING_FLAG = FALSE;
 
-
+/*Main*/
 int main( int argc, char** argv ) {
 
 	/* Initialize mutex and condition variable objects */
@@ -91,15 +81,14 @@ int main( int argc, char** argv ) {
 	pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_JOINABLE);
 	pthread_attr_setdetachstate(&thread_attr_joinable, PTHREAD_CREATE_JOINABLE);
 	
+	/*Main vars - wouldve been a lot easier if there were global*/
 	int arr_size = 50;
 	int i;
 	Train* train_data;
 	pthread_t* train_threads;
 	pthread_t dispatcher_thread;
-	long t;
-	int rc;
-	void* status;
 	
+	/*Ensure there's an input file*/
 	if( argc < 2 ) {
 		printf("[ERROR] Must have at least one argument (HINT: The name of a text file with train data!)\n");
 		return 1;
@@ -146,7 +135,6 @@ void printTimeStamp() {
 	hours = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec )) / (double)3600.00), (double)24.00);
 	minutes = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec )) / (double)60.00), (double)60.00);
 	seconds = fmodf(((((double)current.tv_sec + 1.0e-9*current.tv_nsec ) - ((double)start.tv_sec + 1.0e-9*start.tv_nsec ))), (double)60.00);
-	//printf("\n%02d:%02d:%04.1f\n",hours,minutes,seconds);
 	printf("%02d:%02d:%04.1f",hours,minutes,seconds);
 }
 
@@ -164,8 +152,6 @@ void readInput(char* filename, Train** train_data, int* arr_size) {
 		(*train_data)[train_count].loading_time = loading_time;
 		(*train_data)[train_count].crossing_time = crossing_time;
 		(*train_data)[train_count].train_id = train_count;
-		(*train_data)[train_count].live = LIVE;
-		(*train_data)[train_count].ready = FALSE;
 		(*train_data)[train_count].dispatched = FALSE;
 		pthread_cond_init(&((*train_data)[train_count].convar_cross), NULL);
 		switch(priority){
@@ -178,25 +164,26 @@ void readInput(char* filename, Train** train_data, int* arr_size) {
 	}
 }
 
+/*Init all threads*/
 void initializeThreads( Train** train_data, pthread_t** train_threads ) {
 
 	(*train_threads) = malloc( sizeof(pthread_t)*train_count );
 	int i;
 	for( i = 0; i < train_count; i++ ) {
 		pthread_mutex_lock(&mutex_load);
-		if( DEBUG ) printf("Train %ld waiting to load, %d livethreads exist\n", (*train_data)[i].train_id, num_live_threads);
+		if( DEBUG ) printf("Train %d waiting to load, %d livethreads exist\n", (*train_data)[i].train_id, num_live_threads);
 		num_live_threads++;
 		pthread_create( &(*train_threads)[i], &thread_attr, train_function, (void*)&(*train_data)[i] );
 		
 		if( num_live_threads == train_count ) {
 			pthread_cond_broadcast(&convar_begin_loading);
 			clock_gettime(CLOCK_MONOTONIC, &start);
-			pthread_cond_signal(&convar_dispatch);
 		}
 		pthread_mutex_unlock(&mutex_load);
 	}
 }
 
+/*Function call by every train thread*/
 void* train_function( void* arg ) {
 
 	Train *train_data = (Train*)arg;
@@ -205,10 +192,10 @@ void* train_function( void* arg ) {
 			pthread_cond_wait( &convar_begin_loading, &mutex_load );
 			
 		}
-		if( DEBUG ) printf("Train %ld loading...\n", train_data->train_id);
+		if( DEBUG ) printf("Train %d loading...\n", train_data->train_id);
 	pthread_mutex_unlock(&mutex_load);
 	usleep( train_data->loading_time * 100000 );
-	if( DEBUG ) printf("Train %ld finished loading!\n", train_data->train_id);
+	if( DEBUG ) printf("Train %d finished loading!\n", train_data->train_id);
 
 	//Lock the queue mutex and add a new train entry to the appropriate queue
 	pthread_mutex_lock(&mutex_queue);
@@ -218,9 +205,8 @@ void* train_function( void* arg ) {
 	temp->train_index = train_data->train_id;
 	temp->next = NULL;
 
-	if( DEBUG ) printf("Adding train to queue: %d\n", temp->train_index);
-	printTimeStamp();
-	printf(" Train %ld is ready to go %s\n", train_data->train_id, train_data->dir);
+	if( DEBUG ) printf("Adding train %d to queue: %c\n", temp->train_index, train_data->direction);
+	
 	//Any loaded train goes into the loaded queue
 	//Clearly, loaded trains get sent to their respective queues first
 	if( train_data->direction == 'E') {
@@ -272,10 +258,12 @@ void* train_function( void* arg ) {
 			wb_q = temp;
 		}
 	}
+	printTimeStamp();
+	printf(" Train %2d is ready to go %4s\n", train_data->train_id, train_data->dir);
 	//to prevent spurious wakeup of dispatch convar
 	queue_count++;
 	//There are trains in the queues, signal dispatcher
-	pthread_cond_signal(&convar_dispatch);
+	pthread_cond_signal(&convar_begin_dispatch);
 	pthread_mutex_unlock(&mutex_queue);
 
 	//WAIT HERE FOR DISPATCHER TO SIGNAL GREEN LIGHT
@@ -283,134 +271,154 @@ void* train_function( void* arg ) {
 	while( !train_data->dispatched ) {
 		pthread_cond_wait( &(train_data->convar_cross), &mutex_cross );
 	}
-	//Critical section here
+
 	printTimeStamp();
-	printf(" Train %ld is ON the main track going %s\n", train_data->train_id, train_data->dir);
+	printf(" Train %2d is ON the main track going %4s\n", train_data->train_id, train_data->dir);
+	if( train_data->direction == 'e' || train_data->direction == 'E' ) {
+		last_to_cross = 'E';
+		if( DEBUG ) printf("Last to cross CHANGED: to E\n");
+	}
+	else if( train_data->direction == 'w' || train_data->direction == 'W' ) {
+		last_to_cross = 'W';
+		if( DEBUG ) printf("Last to cross CHANGED: to W\n");
+	}
 	usleep( train_data->crossing_time * 100000 );
 	printTimeStamp();
-	printf(" Train %ld is OFF the main track after going %s\n", train_data->train_id, train_data->dir);
+	printf(" Train %2d is OFF the main track after going %4s\n", train_data->train_id, train_data->dir);
+	CROSSING_FLAG = FALSE;
+	pthread_cond_signal(&convar_dispatch);
 	num_dispatched_trains++;
 	pthread_mutex_unlock(&mutex_cross);
 	pthread_exit((void*) 0);
 }
 
-//Poll loaded trains for dispatch
+/*Select a train only when a train is not crossing
+This allows trains arriving into queues to be resolved
+by the dispatcher; ie, if the dispatcher has committed to 
+greenlighting a train, and while that train is waiting, a higher
+priority train arrives, that new train should be promoted.
+Essentially, only selecting trains when the track is free
+nearly guarantees such a scenario; theres a nice time delay
+for arriving trains to populate the stations and for the dispatcher
+to make its decision from there.*/
 void* dispatcher( void* arg ) {
-
 	Train** train_data = (Train**)arg;
-	pthread_mutex_lock(&mutex_dispatch);
+	pthread_mutex_lock(&mutex_begin_dispatch);
 	while( queue_count < 1 ) {
-		pthread_cond_wait(&convar_dispatch,&mutex_dispatch);	
+		pthread_cond_wait(&convar_begin_dispatch,&mutex_begin_dispatch);	
 	}
-	pthread_mutex_unlock(&mutex_dispatch);
+	pthread_mutex_unlock(&mutex_begin_dispatch);
 
 	while(num_dispatched_trains < train_count) {
-		//This would probably be better solved with a convar
-		//but for now it works fine and doesn't seem to change the
-		//timestamps too much even with extreme test input 
-		//(ie all arrive at 1, load for 1, in the same direction)
-		usleep(20000);
-
 		pthread_mutex_lock(&mutex_queue);
 		int next_train;
-		//If EB high pri train, and other high-pri queue is empty, always send high pri over low pri
-		//Two equal, high priority trains face eachother
-		if( Eb_q != NULL || Wb_q != NULL ) {
-			if( Eb_q != NULL && Wb_q != NULL ) {
-				//Send E if west went last, or if none have gone
-				if( last_to_cross == 'W' || last_to_cross == '\0' ) {
-					resolveQueue('E',&(*train_data));
-					next_train = Eb_q->train_index;
-					Node* temp = Eb_q;
-					Eb_q = Eb_q->next;
-					free(temp);
-					last_to_cross = 'E';	
-				}
-				//Send W if east went last
-				else if( last_to_cross == 'E' ) {
-					resolveQueue('W',&(*train_data));
-					next_train = Wb_q->train_index;
-					Node* temp = Wb_q;
-					Wb_q = Wb_q->next;
-					free(temp);
-					last_to_cross = 'W';
-				}
-			}
-			//Eb ready, Wb null
-			else if( Eb_q != NULL && Wb_q == NULL ) {
+		if( DEBUG ) printf("Attempting to select next train...\n");
+		if( last_to_cross == 'W' || last_to_cross == '\0') {
+			if( Eb_q != NULL ) {
+				CROSSING_FLAG = TRUE;
+				if( DEBUG ) printf("last to cross: %c\n", last_to_cross);
 				resolveQueue('E',&(*train_data));
 				next_train = Eb_q->train_index;
+				if( DEBUG ) printf("SELECTED_a: %d for next train. DISPATCHED?: %d\n", next_train, (*train_data)[next_train].dispatched);
 				Node* temp = Eb_q;
 				Eb_q = Eb_q->next;
 				free(temp);
-				last_to_cross = 'E';
+				//last_to_cross = 'E';
 			}
-			//Wb ready, Eb null
-			else if( Wb_q != NULL && Eb_q == NULL ) {
+			else if( Wb_q != NULL ) {
+				CROSSING_FLAG = TRUE;
+				if( DEBUG ) printf("last to cross: %c\n", last_to_cross);
 				resolveQueue('W',&(*train_data));
 				next_train = Wb_q->train_index;
+				if( DEBUG ) printf("SELECTED_b: %d for next train. DISPATCHED?: %d\n", next_train, (*train_data)[next_train].dispatched);
 				Node* temp = Wb_q;
 				Wb_q = Wb_q->next;
 				free(temp);
-				last_to_cross = 'W';
+				//last_to_cross = 'W';
 			}
-			else {
-				printf("Not catching something\n");
-			}
-		}
-		
-		else {
-			//The low priority stuff
-			if( eb_q != NULL && wb_q != NULL ) {
-				//Send E if west went last, or if none have gone
-				if( last_to_cross == 'w' || last_to_cross == '\0' ) {
-					resolveQueue('e',&(*train_data));
-					next_train = eb_q->train_index;
-					Node* temp = eb_q;
-					eb_q = eb_q->next;
-					free(temp);
-					last_to_cross = 'e';
-				}
-				//Send w if east went last
-				else if( last_to_cross == 'e' ) {
-					resolveQueue('w',&(*train_data));
-					next_train = wb_q->train_index;
-					Node* temp = wb_q;
-					wb_q = wb_q->next;
-					free(temp);
-					last_to_cross = 'w';
-				}
-			}
-			//eb ready, wb null
-			else if( eb_q != NULL && wb_q == NULL ) {
+			else if( eb_q != NULL ) {
+				CROSSING_FLAG = TRUE;
+				if( DEBUG ) printf("last to cross: %c\n", last_to_cross);
 				resolveQueue('e',&(*train_data));
 				next_train = eb_q->train_index;
+				if( DEBUG ) printf("SELECTED_c: %d for next train. DISPATCHED?: %d\n", next_train, (*train_data)[next_train].dispatched);
 				Node* temp = eb_q;
 				eb_q = eb_q->next;
 				free(temp);
-				last_to_cross = 'e';
+				//last_to_cross = 'E';
 			}
-			//Wb ready, Eb null
-			else if( wb_q != NULL && eb_q == NULL ) {
+			else if( wb_q != NULL ) {
+				CROSSING_FLAG = TRUE;
+				if( DEBUG ) printf("last to cross: %c\n", last_to_cross);
 				resolveQueue('w',&(*train_data));
 				next_train = wb_q->train_index;
+				if( DEBUG ) printf("SELECTED_d: %d for next train. DISPATCHED?: %d\n", next_train, (*train_data)[next_train].dispatched);
 				Node* temp = wb_q;
 				wb_q = wb_q->next;
 				free(temp);
-				last_to_cross = 'w';
-			}
-			else {
-				printf("Not catching something\n");	
+				//last_to_cross = 'W';
 			}
 		}
-		
-
+		else { //last to cross was 'E'
+			if( Wb_q != NULL ) {
+				CROSSING_FLAG = TRUE;
+				if( DEBUG ) printf("last to cross: %c\n", last_to_cross);
+				resolveQueue('W',&(*train_data));
+				next_train = Wb_q->train_index;
+				if( DEBUG ) printf("SELECTED_e: %d for next train. DISPATCHED?: %d\n", next_train, (*train_data)[next_train].dispatched);
+				Node* temp = Wb_q;
+				Wb_q = Wb_q->next;
+				free(temp);
+				//last_to_cross = 'W';
+			}
+			else if( Eb_q != NULL ) {
+				CROSSING_FLAG = TRUE;
+				if( DEBUG ) printf("last to cross: %c\n", last_to_cross);
+				resolveQueue('E',&(*train_data));
+				next_train = Eb_q->train_index;
+				if( DEBUG ) printf("SELECTED_f: %d for next train. DISPATCHED?: %d\n", next_train, (*train_data)[next_train].dispatched);
+				Node* temp = Eb_q;
+				Eb_q = Eb_q->next;
+				free(temp);
+				//last_to_cross = 'E';
+			}
+			else if( wb_q != NULL ) {
+				CROSSING_FLAG = TRUE;
+				if( DEBUG ) printf("last to cross: %c\n", last_to_cross);
+				resolveQueue('w',&(*train_data));
+				next_train = wb_q->train_index;
+				if( DEBUG ) printf("SELECTED_g: %d for next train. DISPATCHED?: %d\n", next_train, (*train_data)[next_train].dispatched);
+				Node* temp = wb_q;
+				wb_q = wb_q->next;
+				free(temp);
+				//last_to_cross = 'W';
+			}
+			else if( eb_q != NULL ) {
+				CROSSING_FLAG = TRUE;
+				if( DEBUG ) printf("last to cross: %c\n", last_to_cross);
+				resolveQueue('e',&(*train_data));
+				next_train = eb_q->train_index;
+				if( DEBUG ) printf("SELECTED_h: %d for next train. DISPATCHED?: %d\n", next_train, (*train_data)[next_train].dispatched);
+				Node* temp = eb_q;
+				eb_q = eb_q->next;
+				free(temp);
+				//last_to_cross = 'E';
+			}
+		}
 		pthread_mutex_unlock(&mutex_queue);
 
 		pthread_mutex_lock(&mutex_cross);
 		(*train_data)[next_train].dispatched = TRUE;
+		//CROSSING_FLAG = TRUE;
 		pthread_cond_signal( &(*train_data)[next_train].convar_cross );
-		pthread_mutex_unlock(&mutex_cross);	
+		pthread_mutex_unlock(&mutex_cross);
+
+		// IF CROSSING IS TRUE, WAIT TO SELECT AGAIN
+		pthread_mutex_lock(&mutex_dispatch);
+		while( CROSSING_FLAG == TRUE ) {
+			pthread_cond_wait(&convar_dispatch,&mutex_dispatch);
+		}
+		pthread_mutex_unlock(&mutex_dispatch);
 	}
 	pthread_exit((void*) 0);
 }
@@ -421,7 +429,7 @@ train that's ready with the same loading time, but a lower id (which indicates
 that the train appeared in the input file first)
 */
 void* resolveQueue(char station, Train** train_data){
-	long loading_time;
+	int loading_time;
 	int head_train_index;
 	int smallest_index;
 	int temp;
@@ -431,7 +439,7 @@ void* resolveQueue(char station, Train** train_data){
 		case 'E':
 		if( Eb_q->next != NULL ) {
 			loading_time = (*train_data)[Eb_q->train_index].loading_time;
-			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %ld\n", loading_time);
+			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %d\n", loading_time);
 			smallest_index = Eb_q->train_index;
 			if( DEBUG ) printf("[resolveQueue] Smallest index so far %d\n", smallest_index);
 			cur = Eb_q->next;
@@ -463,7 +471,7 @@ void* resolveQueue(char station, Train** train_data){
 		case 'e':
 		if( eb_q->next != NULL ) {
 			loading_time = (*train_data)[eb_q->train_index].loading_time;
-			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %ld\n", loading_time);
+			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %d\n", loading_time);
 			smallest_index = eb_q->train_index;
 			if( DEBUG ) printf("[resolveQueue] Smallest index so far %d\n", smallest_index);
 			cur = eb_q->next;
@@ -495,7 +503,7 @@ void* resolveQueue(char station, Train** train_data){
 		case 'W':
 		if( Wb_q->next != NULL ) {
 			loading_time = (*train_data)[Wb_q->train_index].loading_time;
-			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %ld\n", loading_time);
+			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %d\n", loading_time);
 			smallest_index = Wb_q->train_index;
 			if( DEBUG ) printf("[resolveQueue] Smallest index so far %d\n", smallest_index);
 			cur = Wb_q->next;
@@ -527,7 +535,7 @@ void* resolveQueue(char station, Train** train_data){
 		case 'w':
 		if( wb_q->next != NULL ) {
 			loading_time = (*train_data)[wb_q->train_index].loading_time;
-			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %ld\n", loading_time);
+			if( DEBUG ) printf("[resolveQueue] Comparing SAME load_time: %d\n", loading_time);
 			smallest_index = wb_q->train_index;
 			if( DEBUG ) printf("[resolveQueue] Smallest index so far %d\n", smallest_index);
 			cur = wb_q->next;
@@ -556,17 +564,5 @@ void* resolveQueue(char station, Train** train_data){
 			if( DEBUG ) printf("[resolveQueue] wb_q-next is NULL!\n");
 		}
 		break;
-	}
-}
-
-void printArray( Train** train_data ) {
-		int i;
-		for( i = 0; i < train_count; i++ ) {
-		if(DEBUG) printf( "[DEBUG] [READING TRAIN %.3ld with PRI: %c, LT: %ld, CT: %ld, LIVE: %ld]\n", 
-			(*train_data)[i].train_id, 
-			(*train_data)[i].direction, 
-			(*train_data)[i].loading_time, 
-			(*train_data)[i].crossing_time,
-			(*train_data)[i].live );
 	}
 }
